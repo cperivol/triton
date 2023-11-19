@@ -1,13 +1,15 @@
 #include "PipelineExpander.h"
 #include "Schedule.h"
+#include "lib/Conversion/TritonGPUToLLVM/TritonGPUToLLVMBase.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Attributes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Support/LogicalResult.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/Support/Debug.h"
 
@@ -20,6 +22,53 @@ namespace ttng = mlir::triton::nvidia_gpu;
 
 // TODO: We can extra some helpers into common utilities once we add more
 // schedules.
+
+// We can pipeline either dot encoding (for the dot operands) or an mma encoding
+// (for the accumulator).
+
+// The encoding attribute can be:
+// - DotOperandEncodingAttr if its the
+// - MmaEncodingAttr if it's an accumulator OR directly interacts with the accumulator
+// - nullptr if it's shared memory used by MMAv3
+class DotOrAccEncodingAttr : public Attribute {
+  auto asDot() const { return dyn_cast<ttg::DotOperandEncodingAttr>(); }
+  auto asMMA() const { return dyn_cast<ttg::MmaEncodingAttr>(); }
+
+public:
+  DotOrAccEncodingAttr(ttg::DotOperandEncodingAttr attr) : Attribute(attr) {}
+  DotOrAccEncodingAttr(ttg::MmaEncodingAttr attr) : Attribute(attr) {}
+  DotOrAccEncodingAttr(std::nullptr_t null) : Attribute(null) {}
+  DotOrAccEncodingAttr() : Attribute() {}
+  explicit DotOrAccEncodingAttr(Attribute attr) : Attribute(attr) {
+    // If we can be neigher dot or MMA then be null.
+    if (!asDot() && !asMMA()) {
+      this->impl = nullptr;
+    }
+  }
+
+  // The encoding of the shared memory tensor that will be used for
+  // pipelining. The argument is the type being loaded.
+  ttg::SharedEncodingAttr makeShared(RankedTensorType loadTy) {
+    // If we are null we can still make a shared and indeed we need to because
+    // in MMAv3 this encoding will be the shared encoding.
+    auto CTALayout = ttg::getCTALayout(loadTy.getEncoding());
+    if (!*this) {
+      return ttg::SharedEncodingAttr::get(loadTy.getContext(),
+                                          loadTy.getShape(),
+                                          ttg::getOrder(loadTy.getEncoding()),
+                                          CTALayout, loadTy.getElementType());
+    }
+
+    assert(getAsOpaquePointer() == loadTy.getEncoding().getAsOpaquePointer());
+    if (auto dotEnc = asDot()) {
+      auto bitWidth = loadTy.getElementType().getIntOrFloatBitWidth();
+      return ttg::SharedEncodingAttr::get(
+          loadTy.getContext(), dotEnc, loadTy.getShape(),
+          ttg::getOrder(loadTy.getEncoding()), CTALayout, bitWidth);
+    }
+    return nullptr;
+  }
+};
 
 /// Replace the yield with a new one with the given operands appended.
 static void appendToYield(scf::ForOp forOp, ArrayRef<Value> newOperands) {
@@ -144,27 +193,29 @@ static void createAsyncLoad(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
 
 namespace {
 struct LoadDotOperand {
-  LoadDotOperand(tt::LoadOp load,
-                 ttg::DotOperandEncodingAttr dotOperandEncoding)
-      : load(load), dotOperandEncoding(dotOperandEncoding) {}
-  tt::LoadOp load;
-  ttg::DotOperandEncodingAttr dotOperandEncoding;
+  LoadDotOperand(tt::LoadOp loadOp, DotOrAccEncodingAttr dotOperandEncoding)
+      : loadOp(loadOp), dotOperandEncoding(dotOperandEncoding) {}
+  tt::LoadOp loadOp;
+
+  // The encoding of the dot operand corresponding to the load.
+  DotOrAccEncodingAttr dotOperandEncoding;
 };
 } // namespace
 
-// If all the transitive uses of the given value have are used by a convert to
-// the same dot operand encoding, return the encoding. Otherwise return nullptr.
-static ttg::DotOperandEncodingAttr allTransitiveUsesHaveDotEncoding(Value val) {
-  ttg::DotOperandEncodingAttr attr;
+// If all the transitive uses of the given value have are used by a dot
+// operand. Otherwise return nullptr.
+static DotOrAccEncodingAttr isEventuallyDotOperand(Value val) {
+  DotOrAccEncodingAttr attr;
   for (Operation *user : val.getUsers()) {
     if (user->getNumResults() != 1)
       return nullptr;
-    auto tensorType = user->getResult(0).getType().dyn_cast<RankedTensorType>();
+    Value user_result = user->getResult(0);
+    auto tensorType = user_result.getType().dyn_cast<RankedTensorType>();
     if (!tensorType)
       return nullptr;
-    ttg::DotOperandEncodingAttr tempAttr;
+    DotOrAccEncodingAttr tempAttr;
     if (tensorType.getEncoding().isa<ttg::SharedEncodingAttr>()) {
-      tempAttr = allTransitiveUsesHaveDotEncoding(user->getResult(0));
+      tempAttr = isEventuallyDotOperand(user_result);
     } else {
       auto convertLayout = llvm::dyn_cast<ttg::ConvertLayoutOp>(user);
       if (!convertLayout)
@@ -173,9 +224,10 @@ static ttg::DotOperandEncodingAttr allTransitiveUsesHaveDotEncoding(Value val) {
           convertLayout.getResult().getType().dyn_cast<RankedTensorType>();
       if (!tensorType)
         return nullptr;
-      tempAttr =
-          tensorType.getEncoding().dyn_cast<ttg::DotOperandEncodingAttr>();
+      tempAttr = DotOrAccEncodingAttr(tensorType.getEncoding());
     }
+
+    // If we found a dead end or if the layout changed fail.
     if (!tempAttr || (attr != nullptr && attr != tempAttr))
       return nullptr;
     attr = tempAttr;
@@ -187,6 +239,8 @@ static ttg::DotOperandEncodingAttr allTransitiveUsesHaveDotEncoding(Value val) {
 static std::optional<LoadDotOperand> loadDotOperand(tt::LoadOp loadOp,
                                                     bool &hasMMAV3) {
   bool isCandidate = false;
+  // First check the case `cvt(load()) : _ -> #shared`. Then assume there is a
+  // dot down the line.
   if (loadOp.getResult().hasOneUse()) {
     Operation *use = *loadOp.getResult().getUsers().begin();
     if (auto convertLayout = llvm::dyn_cast<ttg::ConvertLayoutOp>(use)) {
@@ -201,23 +255,26 @@ static std::optional<LoadDotOperand> loadDotOperand(tt::LoadOp loadOp,
           auto oldOrder = ttg::getOrder(ty.getEncoding());
           if (newOrder[0] == oldOrder[0] || newOrder[1] == oldOrder[1]) {
             // The operand of MMAv3 is in SharedEncoding and it's order should
-            // not be changed after FuseTranspositions Pass. So we only pipeline
-            // the load if the order of the loaded BlockedEncoding is the same
-            // as the order of the SharedEncoding it is converted to.
+            // not be changed after FuseTranspositions Pass. So we only
+            // pipeline the load if the order of the loaded BlockedEncoding is
+            // the same as the order of the SharedEncoding it is converted to.
             // TODO: remove this constraint once the LoadOp supports transpose
             // fusion
             hasMMAV3 = true;
+            // TODO(cperivol): maybe we should keep track of the shared
+            // encoding.
             return LoadDotOperand(loadOp, nullptr);
           }
         }
       }
     }
   }
-  ttg::DotOperandEncodingAttr attr =
-      allTransitiveUsesHaveDotEncoding(loadOp.getResult());
-  if (!attr)
+
+  // Now outsource to `isEventuallyDotOperand`.
+  if (auto attr = isEventuallyDotOperand(loadOp.getResult()))
+    return LoadDotOperand(loadOp, attr);
+  else
     return std::nullopt;
-  return LoadDotOperand(loadOp, attr);
 }
 
 /// Collect loads to pipeline. Return success if we can pipeline this loop
@@ -250,7 +307,8 @@ static void collectOpsToPipeline(scf::ForOp forOp,
         unsigned width = vec * ty.getIntOrFloatBitWidth();
         // We do not pipeline all loads for the following reasons:
         // 1. On nvidia GPUs, cp.async's cp-size can only be 4, 8 and 16.
-        // 2. It's likely that pipling small loads won't offer much performance
+        // 2. It's likely that pipling small loads won't offer much
+        // performance
         //    improvement and may even hurt performance by increasing register
         //    pressure.
         if (width >= 32)
@@ -269,27 +327,16 @@ static void collectOpsToPipeline(scf::ForOp forOp,
 
 // Create an allocation that can old distance number of loadOp shapes.
 static Value createAlloc(scf::ForOp &forOp, tt::LoadOp loadOp,
-                         ttg::DotOperandEncodingAttr dotOpEnc,
-                         unsigned distance) {
+                         DotOrAccEncodingAttr dotOpEnc, unsigned distance) {
   OpBuilder builder(forOp);
-  auto ty = loadOp.getType().cast<RankedTensorType>();
-  Attribute sharedEnc;
-  auto CTALayout = ttg::getCTALayout(ty.getEncoding());
-  if (dotOpEnc) {
-    unsigned bitWidth = ty.getElementType().getIntOrFloatBitWidth();
-    sharedEnc = ttg::SharedEncodingAttr::get(
-        ty.getContext(), dotOpEnc, ty.getShape(),
-        ttg::getOrder(ty.getEncoding()), CTALayout, bitWidth);
-  } else {
-    // MMAv3
-    sharedEnc = ttg::SharedEncodingAttr::get(ty.getContext(), ty.getShape(),
-                                             ttg::getOrder(ty.getEncoding()),
-                                             CTALayout, ty.getElementType());
-  }
-  SmallVector<int64_t> bufferShape(ty.getShape().begin(), ty.getShape().end());
+  auto loadTy = loadOp.getType().cast<RankedTensorType>();
+  auto sharedEnc = dotOpEnc.makeShared(loadTy);
+
+  SmallVector<int64_t> bufferShape(loadTy.getShape().begin(),
+                                   loadTy.getShape().end());
   bufferShape.insert(bufferShape.begin(), distance);
   Type allocType =
-      RankedTensorType::get(bufferShape, ty.getElementType(), sharedEnc);
+      RankedTensorType::get(bufferShape, loadTy.getElementType(), sharedEnc);
   Value alloc = builder.create<mlir::triton::gpu::AllocTensorOp>(
       loadOp.getLoc(), allocType);
   return alloc;
@@ -315,7 +362,7 @@ static void createAsynOps(scf::ForOp &forOp, ArrayRef<LoadDotOperand> loads,
   bool needsMbarrierPhase = false;
   bool needsAsyncWait = false;
   for (const LoadDotOperand &loadOperand : loads) {
-    tt::LoadOp loadOp = loadOperand.load;
+    tt::LoadOp loadOp = loadOperand.loadOp;
     Value alloc =
         createAlloc(forOp, loadOp, loadOperand.dotOperandEncoding, numBuffers);
     assert(alloc && "Failed to create alloc for the async load.");
@@ -522,8 +569,9 @@ static std::vector<std::pair<Operation *, unsigned>>
 createSchedule(scf::ForOp forOp, int numStages, bool prefetchExtract) {
   SmallVector<Operation *> insertOps;
   SmallVector<Operation *> extractOps;
-  // Find the insert/extract ops that will go respectively in stage 0 and stage
-  // `numStages - 2`. All the other operations will go in stage `numStages - 1`.
+  // Find the insert/extract ops that will go respectively in stage 0 and
+  // stage `numStages - 2`. All the other operations will go in stage
+  // `numStages - 1`.
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (isa<ttg::InsertSliceAsyncOp, ttg::AsyncCommitGroupOp,
             ttng::MBarrierArriveOp, ttng::InsertSliceAsyncV2Op>(op))
@@ -606,7 +654,7 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
   if (loads.empty())
     return false;
   bool hasAsynCp = llvm::any_of(loads, [](LoadDotOperand &load) {
-    return !isLoadFromTensorPtr(load.load);
+    return !isLoadFromTensorPtr(load.loadOp);
   });
   // 2. Convert the loads into async loads and create the allocs.
   createAsynOps(forOp, loads, numStages, hasMMAV3);
@@ -768,12 +816,11 @@ void mlir::triton::asyncLaunchDots(scf::ForOp forOp) {
     return;
 
   OpBuilder builder(forOp);
-  // 0. insert dot_wait after the last dot in the loop as we implicitly pipeline
-  // wgmma ops by one stage.
-  // This is needed to prevent shared memory inputs to be overriden before the
-  // operation is completed.
-  // TODO: merge this with the rest of the pipelining transformation and look at
-  // a better representation for async dots.
+  // 0. insert dot_wait after the last dot in the loop as we implicitly
+  // pipeline wgmma ops by one stage. This is needed to prevent shared memory
+  // inputs to be overriden before the operation is completed.
+  // TODO: merge this with the rest of the pipelining transformation and look
+  // at a better representation for async dots.
   tt::DotOp lastDot = dots.back();
   auto loc = lastDot.getLoc();
   builder.setInsertionPointAfter(lastDot);
@@ -811,7 +858,7 @@ void mlir::triton::asyncLaunchDots(scf::ForOp forOp) {
     }
   }
 
-  // 3. potentially remove redundant dot_wait after dot_async if having mutiple
-  // DotOp in the loop
+  // 3. potentially remove redundant dot_wait after dot_async if having
+  // mutiple DotOp in the loop
   removeExtraWait(dotWait, hasDotWait0);
 }
