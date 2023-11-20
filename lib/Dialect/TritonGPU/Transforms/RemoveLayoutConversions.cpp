@@ -31,50 +31,6 @@ using triton::gpu::SliceEncodingAttr;
 //
 // -----------------------------------------------------------------------------
 
-// dot(a, b, load(ptr)) -> add(load(ptr), dot(a, b, 0))
-class ConvertDotConvert : public mlir::RewritePattern {
-public:
-  ConvertDotConvert(mlir::MLIRContext *context)
-      : mlir::RewritePattern(triton::gpu::ConvertLayoutOp::getOperationName(),
-                             1, context) {}
-
-  LogicalResult
-  matchAndRewrite(mlir::Operation *op,
-                  mlir::PatternRewriter &rewriter) const override {
-    auto dstOp = cast<triton::gpu::ConvertLayoutOp>(op);
-    auto dotOp = dstOp.getSrc().getDefiningOp<triton::DotOp>();
-    if (!dotOp)
-      return mlir::failure();
-    if (std::distance(dstOp->user_begin(), dstOp->user_end()) != 1 ||
-        std::distance(dotOp->user_begin(), dotOp->user_end()) != 1)
-      return mlir::failure();
-    auto cvtOp =
-        dotOp.getOperand(2).getDefiningOp<triton::gpu::ConvertLayoutOp>();
-    if (!cvtOp)
-      return mlir::failure();
-    if (!cvtOp.getSrc().getDefiningOp<triton::LoadOp>())
-      return failure();
-    auto dstTy = dstOp.getResult().getType().cast<RankedTensorType>();
-    auto srcTy = cvtOp.getOperand().getType().cast<RankedTensorType>();
-    if (dstTy != srcTy)
-      return mlir::failure();
-
-    auto _0f = rewriter.create<arith::ConstantOp>(
-        op->getLoc(), dstTy.getElementType(),
-        rewriter.getZeroAttr(dstTy.getElementType()));
-    auto _0 = rewriter.create<triton::SplatOp>(
-        op->getLoc(), dotOp.getResult().getType(), _0f);
-    auto newDot = rewriter.create<triton::DotOp>(
-        op->getLoc(), dotOp.getResult().getType(), dotOp.getOperand(0),
-        dotOp.getOperand(1), _0, dotOp.getAllowTF32(),
-        dotOp.getMaxNumImpreciseAcc());
-    auto newCvt = rewriter.create<triton::gpu::ConvertLayoutOp>(
-        op->getLoc(), dstTy, newDot.getResult());
-    rewriter.replaceOpWithNewOp<arith::AddFOp>(op, newCvt, cvtOp.getOperand());
-    return mlir::success();
-  }
-};
-
 // Class to propagate layout globally within a function.
 // The current algorithm works by analysis the IR and doing a one shot rewrite
 // based on the analysis. The algorithm is as follows:
@@ -980,7 +936,6 @@ public:
     hoistConvert(m);
 
     mlir::RewritePatternSet decomposePatterns(context);
-    decomposePatterns.add<ConvertDotConvert>(context);
     if (mlir::applyPatternsAndFoldGreedily(m, std::move(decomposePatterns))
             .failed()) {
       signalPassFailure();
